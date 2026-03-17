@@ -3,7 +3,10 @@ Pillow==10.3.0
 numpy==1.26.4
 python-dotenv==1.0.1
 aiohttp==3.9.5
-# Optional — improves TGS/Lottie rendering significantly
-# rlottie-python==1.3.4
-# Optional — enables WEBM/MP4 frame extraction
+
+# Native Lottie/TGS renderer — REQUIRED for animated stickers/emoji
+# Installs pre-built wheels on Linux/macOS/Windows
+rlottie-python==1.3.4
+
+# Optional — enables WEBM/MP4 video sticker extraction
 # imageio[ffmpeg]==2.34.1

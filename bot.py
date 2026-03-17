@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import time
 import zlib
@@ -303,56 +304,139 @@ async def apply_watermark(
 
 
 # ─────────────────────────────────────────────
-# LOTTIE / TGS  — proper color extraction
+# LOTTIE / TGS  — deep color + shape extraction
 # ─────────────────────────────────────────────
 
+def _k_to_rgb(k: Any) -> Optional[tuple[int, int, int]]:
+    """
+    Convert a Lottie color value to (R, G, B) 0-255.
+    Handles:
+      - Static:   k = [r, g, b, a]   (floats 0-1)
+      - Animated: k = [{"s": [r,g,b,a], "t": …}, …]
+    """
+    if isinstance(k, list) and k:
+        # Animated keyframes → take first keyframe value
+        if isinstance(k[0], dict):
+            for kf in k:
+                sv = kf.get("s") or kf.get("e")
+                if isinstance(sv, list) and len(sv) >= 3:
+                    k = sv
+                    break
+            else:
+                return None
+        # Static [r, g, b, ...]
+        if isinstance(k[0], (int, float)) and len(k) >= 3:
+            return (
+                min(255, int(abs(float(k[0])) * 255)),
+                min(255, int(abs(float(k[1])) * 255)),
+                min(255, int(abs(float(k[2])) * 255)),
+            )
+    return None
+
+
 def _lottie_extract_colors(obj: Any) -> list[tuple[int, int, int]]:
-    """Walk a Lottie JSON tree and collect all fill/stroke RGB colors."""
+    """
+    Recursively walk a Lottie JSON tree collecting RGB colors from:
+      fl  = fill         st  = stroke
+      gf  = gradient fill   sc = solid color layer
+    """
     colors: list[tuple[int, int, int]] = []
 
     if isinstance(obj, dict):
         ty = obj.get("ty")
 
-        # Solid fill
-        if ty == "fl":
+        # ── Solid fill ────────────────────────
+        if ty in ("fl", "st"):
             c = obj.get("c", {})
-            k = c.get("k") if isinstance(c, dict) else None
-            if isinstance(k, list) and len(k) >= 3:
-                if isinstance(k[0], (int, float)):
-                    colors.append((
-                        min(255, int(abs(k[0]) * 255)),
-                        min(255, int(abs(k[1]) * 255)),
-                        min(255, int(abs(k[2]) * 255)),
-                    ))
-                elif isinstance(k[0], dict):
-                    # Animated keyframe — take first
-                    sv = k[0].get("s") or k[0].get("e") or [1, 1, 1]
-                    if isinstance(sv, list) and len(sv) >= 3:
+            k = c.get("k") if isinstance(c, dict) else c
+            rgb = _k_to_rgb(k)
+            if rgb:
+                colors.append(rgb)
+
+        # ── Solid color layer (sc) ────────────
+        # Lottie solid layers store color as hex string in "sc"
+        if "sc" in obj and isinstance(obj["sc"], str):
+            try:
+                rgb = hex_to_rgb(obj["sc"].lstrip("#").zfill(6))
+                colors.append(rgb)
+            except Exception:
+                pass
+
+        # ── Gradient fill / stroke ────────────
+        if ty in ("gf", "gs"):
+            g  = obj.get("g", {})
+            np_ = g.get("p", 0)
+            ks  = g.get("k", {})
+            gk  = ks.get("k") if isinstance(ks, dict) else ks
+            # Static gradient: flat list [pos, r, g, b, pos, r, g, b, ...]
+            if isinstance(gk, list) and gk and isinstance(gk[0], (int, float)):
+                step = 4
+                for i in range(0, min(len(gk), np_ * step), step):
+                    if i + 3 < len(gk):
                         colors.append((
-                            min(255, int(abs(sv[0]) * 255)),
-                            min(255, int(abs(sv[1]) * 255)),
-                            min(255, int(abs(sv[2]) * 255)),
+                            min(255, int(abs(float(gk[i+1])) * 255)),
+                            min(255, int(abs(float(gk[i+2])) * 255)),
+                            min(255, int(abs(float(gk[i+3])) * 255)),
                         ))
 
-        # Stroke
-        if ty == "st":
-            c = obj.get("c", {})
-            k = c.get("k") if isinstance(c, dict) else None
-            if isinstance(k, list) and len(k) >= 3 and isinstance(k[0], (int, float)):
-                colors.append((
-                    min(255, int(abs(k[0]) * 255)),
-                    min(255, int(abs(k[1]) * 255)),
-                    min(255, int(abs(k[2]) * 255)),
-                ))
-
         for v in obj.values():
-            colors.extend(_lottie_extract_colors(v))
+            if isinstance(v, (dict, list)):
+                colors.extend(_lottie_extract_colors(v))
 
     elif isinstance(obj, list):
         for item in obj:
-            colors.extend(_lottie_extract_colors(item))
+            if isinstance(item, (dict, list)):
+                colors.extend(_lottie_extract_colors(item))
 
     return colors
+
+
+# ── Lottie shape-path renderer (bezier → Pillow polygon) ──
+
+def _lottie_get_shapes(layers: list[dict]) -> list[dict]:
+    """Flatten all shape items from all layers."""
+    shapes: list[dict] = []
+    for layer in layers:
+        lt = layer.get("ty")
+        if lt == 4:  # shape layer
+            for s in layer.get("shapes", []):
+                shapes.append(s)
+        _collect_shapes_recursive(layer.get("shapes", []), shapes)
+    return shapes
+
+
+def _collect_shapes_recursive(items: list, out: list) -> None:
+    for item in items:
+        if isinstance(item, dict):
+            ty = item.get("ty")
+            if ty in ("fl", "st", "sh", "rc", "el", "sr"):
+                out.append(item)
+            if ty == "gr":
+                _collect_shapes_recursive(item.get("it", []), out)
+
+
+def _lottie_bezier_to_points(
+    vertices: list, in_tangents: list, out_tangents: list, n: int = 12
+) -> list[tuple[float, float]]:
+    """Approximate a Lottie bezier path as a flat polygon (n segments/curve)."""
+    pts: list[tuple[float, float]] = []
+    nv  = len(vertices)
+    if nv < 2:
+        return [(v[0], v[1]) for v in vertices]
+
+    for i in range(nv):
+        p0 = vertices[i]
+        p3 = vertices[(i + 1) % nv]
+        c1 = [p0[0] + out_tangents[i][0], p0[1] + out_tangents[i][1]]
+        c2 = [p3[0] + in_tangents[(i + 1) % nv][0],
+              p3[1] + in_tangents[(i + 1) % nv][1]]
+        for j in range(n):
+            t  = j / n
+            mt = 1 - t
+            x  = mt**3*p0[0] + 3*mt**2*t*c1[0] + 3*mt*t**2*c2[0] + t**3*p3[0]
+            y  = mt**3*p0[1] + 3*mt**2*t*c1[1] + 3*mt*t**2*c2[1] + t**3*p3[1]
+            pts.append((x, y))
+    return pts
 
 
 def _render_lottie_fallback_frame(
@@ -360,76 +444,175 @@ def _render_lottie_fallback_frame(
     h: int,
     frame_idx: int,
     total: int,
-    colors: list[tuple[int, int, int]],
+    palette: list[tuple[int, int, int]],
+    lottie: dict,
 ) -> Image.Image:
     """
-    Render one frame using extracted Lottie palette.
-    Draws concentric animated shapes in correct colors —
-    no longer a plain black circle.
+    Attempt to rasterise one Lottie frame without rlottie.
+    Strategy:
+      1. Try to render actual bezier paths from shape layers.
+      2. Fall back to animated concentric rings in extracted palette.
     """
     img  = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     draw = ImageDraw.Draw(img)
-    t    = frame_idx / max(1, total - 1)  # 0.0 → 1.0
+    t    = frame_idx / max(1, total - 1)
 
-    n = len(colors)
-    for i, col in enumerate(colors):
-        # Each color occupies a ring; outermost = first color
-        outer_r = (n - i) / n
-        inner_r = (n - i - 1) / n
+    rendered_shapes = 0
+    layers = lottie.get("layers", [])
 
-        # Subtle pulse animation
-        pulse  = 0.92 + 0.08 * abs(((t * 2 + i * 0.4) % 2.0) - 1.0)
-        ro_x   = int(w / 2 * outer_r * pulse)
-        ro_y   = int(h / 2 * outer_r * pulse)
-        ri_x   = int(w / 2 * inner_r * pulse)
-        ri_y   = int(h / 2 * inner_r * pulse)
-        cx, cy = w // 2, h // 2
+    for layer in layers:
+        if layer.get("ty") != 4:   # only shape layers
+            continue
+        # Collect fill color for this layer
+        layer_colors = _lottie_extract_colors(layer)
+        fill_color   = layer_colors[0] if layer_colors else (255, 255, 255)
 
-        # Outer ellipse with alpha fade toward centre
-        alpha = max(60, 230 - i * 30)
-        draw.ellipse([cx-ro_x, cy-ro_y, cx+ro_x, cy+ro_y], fill=(*col, alpha))
-        # Punch inner hole to create ring effect (except last = solid core)
-        if i < n - 1 and ri_x > 2 and ri_y > 2:
-            draw.ellipse([cx-ri_x, cy-ri_y, cx+ri_x, cy+ri_y], fill=(0, 0, 0, 0))
+        shapes = layer.get("shapes", [])
+        for shape in shapes:
+            ty = shape.get("ty")
+
+            # ── Rectangle ────────────────────
+            if ty == "rc":
+                size_k = shape.get("s", {}).get("k", [w//2, h//2])
+                pos_k  = shape.get("p", {}).get("k", [w//2, h//2])
+                sw = size_k[0] if isinstance(size_k, list) else w//2
+                sh = size_k[1] if isinstance(size_k, list) else h//2
+                px = pos_k[0]  if isinstance(pos_k,  list) else w//2
+                py = pos_k[1]  if isinstance(pos_k,  list) else h//2
+                draw.rectangle(
+                    [px-sw/2, py-sh/2, px+sw/2, py+sh/2],
+                    fill=(*fill_color, 220),
+                )
+                rendered_shapes += 1
+
+            # ── Ellipse ───────────────────────
+            elif ty == "el":
+                size_k = shape.get("s", {}).get("k", [w//2, h//2])
+                pos_k  = shape.get("p", {}).get("k", [w//2, h//2])
+                sw = size_k[0] if isinstance(size_k, list) else w//2
+                sh = size_k[1] if isinstance(size_k, list) else h//2
+                px = pos_k[0]  if isinstance(pos_k,  list) else w//2
+                py = pos_k[1]  if isinstance(pos_k,  list) else h//2
+                draw.ellipse(
+                    [px-sw/2, py-sh/2, px+sw/2, py+sh/2],
+                    fill=(*fill_color, 220),
+                )
+                rendered_shapes += 1
+
+            # ── Bezier path ───────────────────
+            elif ty == "sh":
+                ks  = shape.get("ks", {})
+                kv  = ks.get("k")
+                if isinstance(kv, dict):
+                    # Non-animated path
+                    verts = kv.get("v", [])
+                    ins   = kv.get("i", [[0,0]]*len(verts))
+                    outs  = kv.get("o", [[0,0]]*len(verts))
+                elif isinstance(kv, list) and kv and isinstance(kv[0], dict):
+                    # Animated — pick closest keyframe
+                    best = kv[0]
+                    for kf in kv:
+                        if isinstance(kf.get("t"), (int, float)):
+                            if kf["t"] <= frame_idx:
+                                best = kf
+                    sv   = best.get("s", [best.get("v", {})])
+                    path = sv[0] if isinstance(sv, list) and sv else {}
+                    verts = path.get("v", [])
+                    ins   = path.get("i", [[0,0]]*len(verts))
+                    outs  = path.get("o", [[0,0]]*len(verts))
+                else:
+                    continue
+
+                if len(verts) >= 2:
+                    pts = _lottie_bezier_to_points(verts, ins, outs)
+                    if len(pts) >= 3:
+                        draw.polygon(pts, fill=(*fill_color, 220))
+                        rendered_shapes += 1
+
+            # ── Group — recurse ───────────────
+            elif ty == "gr":
+                sub_colors  = _lottie_extract_colors(shape)
+                sub_fill    = sub_colors[0] if sub_colors else fill_color
+                for sub in shape.get("it", []):
+                    sty = sub.get("ty")
+                    if sty == "el":
+                        size_k = sub.get("s", {}).get("k", [w//2, h//2])
+                        pos_k  = sub.get("p", {}).get("k", [w//2, h//2])
+                        # Handle animated size/position
+                        if isinstance(size_k, list) and size_k and isinstance(size_k[0], dict):
+                            size_k = size_k[0].get("s", [w//2, h//2])
+                        if isinstance(pos_k,  list) and pos_k  and isinstance(pos_k[0],  dict):
+                            pos_k  = pos_k[0].get("s",  [w//2, h//2])
+                        sw = size_k[0] if isinstance(size_k, list) and len(size_k)>0 else w//2
+                        sh = size_k[1] if isinstance(size_k, list) and len(size_k)>1 else h//2
+                        px = pos_k[0]  if isinstance(pos_k,  list) and len(pos_k)>0  else w//2
+                        py = pos_k[1]  if isinstance(pos_k,  list) and len(pos_k)>1  else h//2
+                        draw.ellipse(
+                            [px-sw/2, py-sh/2, px+sw/2, py+sh/2],
+                            fill=(*sub_fill, 220),
+                        )
+                        rendered_shapes += 1
+
+    # ── If no shapes rendered — animated rings fallback ──────────────────
+    if rendered_shapes == 0:
+        n = max(1, len(palette))
+        for i, col in enumerate(palette):
+            outer = (n - i) / n
+            inner = max(0.0, (n - i - 1) / n)
+            pulse = 0.88 + 0.12 * abs(((t * 2 + i * 0.4) % 2.0) - 1.0)
+            ro_x  = int(w / 2 * 0.85 * outer * pulse)
+            ro_y  = int(h / 2 * 0.85 * outer * pulse)
+            ri_x  = int(w / 2 * 0.85 * inner * pulse)
+            ri_y  = int(h / 2 * 0.85 * inner * pulse)
+            cx, cy = w // 2, h // 2
+            a_val  = max(80, 240 - i * 40)
+            draw.ellipse([cx-ro_x, cy-ro_y, cx+ro_x, cy+ro_y], fill=(*col, a_val))
+            if i < n - 1 and ri_x > 2 and ri_y > 2:
+                draw.ellipse([cx-ri_x, cy-ri_y, cx+ri_x, cy+ri_y], fill=(0, 0, 0, 0))
 
     return img
 
 
 def _tgs_to_frames_fallback(data: bytes) -> tuple[list[Image.Image], int]:
+    """
+    Fallback TGS renderer (no rlottie):
+    Decompress → parse Lottie JSON → extract real shapes + colors → render.
+    """
     try:
         raw    = zlib.decompress(data, 16 + zlib.MAX_WBITS)
         lottie = json.loads(raw)
     except Exception as exc:
         logger.error("TGS decompress: %s", exc)
-        return [Image.new("RGBA", (512, 512), (255, 255, 255, 220))], 30
+        # Return a single visible white frame so pipeline doesn't crash
+        img = Image.new("RGBA", (512, 512), (0, 0, 0, 0))
+        ImageDraw.Draw(img).ellipse([128, 128, 384, 384], fill=(255, 255, 255, 220))
+        return [img], 30
 
     ip = int(lottie.get("ip", 0))
     op = int(lottie.get("op", 60))
     fr = float(lottie.get("fr", 30))
     w  = int(lottie.get("w", 512))
     h  = int(lottie.get("h", 512))
-
     n_frames = max(1, op - ip)
 
-    # Extract fill colors; deduplicate
+    # Extract palette (deduplicated, skip pure-black)
     raw_colors = _lottie_extract_colors(lottie)
-    seen: set[tuple[int,int,int]] = set()
+    seen:    set[tuple[int,int,int]]  = set()
     palette: list[tuple[int,int,int]] = []
     for c in raw_colors:
-        if c not in seen and c != (0, 0, 0):  # skip pure black (transparency artifacts)
+        if c not in seen and max(c) > 10:   # ignore near-black
             seen.add(c)
             palette.append(c)
-
     if not palette:
         palette = [(255, 255, 255)]
 
     logger.info(
-        "TGS fallback: %d frames @ %.0ffps  size=%dx%d  palette=%s",
-        n_frames, fr, w, h, palette[:6],
+        "TGS fallback: %d frames @ %.0f fps  %dx%d  palette=%s",
+        n_frames, fr, w, h, palette[:8],
     )
 
     frames = [
-        _render_lottie_fallback_frame(w, h, i, n_frames, palette)
+        _render_lottie_fallback_frame(w, h, i, n_frames, palette, lottie)
         for i in range(n_frames)
     ]
     return frames, int(fr)
@@ -1179,8 +1362,53 @@ async def cmd_stats(msg: Message) -> None:
 # MAIN
 # ─────────────────────────────────────────────
 
+PID_FILE = Path(os.getenv("PID_FILE", "bot.pid"))
+
+
+def _acquire_pid_lock() -> None:
+    """
+    Prevent two bot instances from running simultaneously.
+    Uses a PID file + flock (Linux/macOS).
+    On Windows falls back to checking the PID file manually.
+    """
+    import fcntl  # noqa: F401 — available on Linux/macOS
+
+    try:
+        _acquire_pid_lock._fd = open(PID_FILE, "w")          # type: ignore[attr-defined]
+        fcntl.flock(_acquire_pid_lock._fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+        _acquire_pid_lock._fd.write(str(os.getpid()))         # type: ignore[attr-defined]
+        _acquire_pid_lock._fd.flush()                         # type: ignore[attr-defined]
+        logger.info("PID lock acquired (%s)", PID_FILE)
+    except (ImportError, AttributeError):
+        # Windows — simple PID file check
+        if PID_FILE.exists():
+            try:
+                old_pid = int(PID_FILE.read_text().strip())
+                # Check if process is alive
+                os.kill(old_pid, 0)
+                logger.error(
+                    "Another bot instance is already running (PID %d). "
+                    "Kill it first: kill %d",
+                    old_pid, old_pid,
+                )
+                sys.exit(1)
+            except (ProcessLookupError, ValueError):
+                pass  # Stale PID file — overwrite
+        PID_FILE.write_text(str(os.getpid()))
+    except BlockingIOError:
+        logger.error(
+            "Another bot instance is already running!\n"
+            "  Stop it first:  pkill -f bot.py\n"
+            "  Or remove:       rm %s",
+            PID_FILE,
+        )
+        sys.exit(1)
+
+
 async def main() -> None:
+    _acquire_pid_lock()
     db_init()
+
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
@@ -1189,7 +1417,13 @@ async def main() -> None:
         asyncio.create_task(queue_worker(i + 1))
 
     logger.info("Bot started (workers=%d)", QUEUE_WORKERS)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    try:
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    finally:
+        try:
+            PID_FILE.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
