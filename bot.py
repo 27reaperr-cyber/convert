@@ -237,7 +237,7 @@ def hsv_to_rgb(h: float, s: float, v: float) -> tuple[int, int, int]:
 
 
 # ─────────────────────────────────────────────
-# SMART RECOLOR — HSV 5-tone, preserves luminance
+# SMART RECOLOR — smooth HSV colorize, no harsh bands
 # ─────────────────────────────────────────────
 
 def smart_recolor_frame(
@@ -245,32 +245,62 @@ def smart_recolor_frame(
     target_hex: str,
     bg_hex: str,
 ) -> np.ndarray:
-    tr, tg, tb    = hex_to_rgb(target_hex)
-    br, bg_r, bb  = hex_to_rgb(bg_hex)
-    t_h, t_s, _   = rgb_to_hsv(tr, tg, tb)
+    """
+    Smooth per-pixel colorisation:
+      • Keeps the target hue constant across all pixels
+      • Value  = target_V × lum^GAMMA  (smooth brightness curve)
+      • Sat    = target_S × clip(lum/0.25, 0, 1)  (dark pixels desaturate → clean outlines)
+      • Fully vectorised — no discrete bands, no harsh shadows
+      • Composites result over bg using original alpha
+    """
+    GAMMA = 0.65  # >1 = darker shadows, <1 = brighter mid-tones; 0.65 gives clean look
 
-    if frame.shape[2] == 4:
-        alpha = frame[:,:,3:4].astype(np.float32) / 255.0
-        rgb   = frame[:,:,:3].astype(np.float32)
+    tr, tg, tb   = hex_to_rgb(target_hex)
+    br, bg_r, bb = hex_to_rgb(bg_hex)
+    t_h, t_s, t_v = rgb_to_hsv(tr, tg, tb)
+
+    if frame.ndim == 3 and frame.shape[2] == 4:
+        alpha = frame[:, :, 3].astype(np.float32) / 255.0   # (H, W)
+        rgb   = frame[:, :, :3].astype(np.float32)
     else:
-        alpha = np.ones((*frame.shape[:2], 1), dtype=np.float32)
-        rgb   = frame[:,:,:3].astype(np.float32)
+        alpha = np.ones(frame.shape[:2], dtype=np.float32)
+        rgb   = frame[:, :, :3].astype(np.float32) if frame.ndim == 3 else frame.astype(np.float32)
 
-    lum = (0.2126*rgb[:,:,0] + 0.7152*rgb[:,:,1] + 0.0722*rgb[:,:,2]) / 255.0
+    # ── Luminance (ITU-R BT.709) ──────────────
+    lum = (0.2126 * rgb[:, :, 0]
+         + 0.7152 * rgb[:, :, 1]
+         + 0.0722 * rgb[:, :, 2]) / 255.0   # (H, W), range 0..1
 
-    shades = [
-        hsv_to_rgb(t_h, max(0.0, t_s - (1-lv)*0.3), lv)
-        for lv in (0.15, 0.35, 0.55, 0.75, 0.95)
+    # ── Smooth V and S maps ───────────────────
+    out_v = t_v * np.power(np.clip(lum, 0.0, 1.0), GAMMA)          # (H, W)
+    out_s = t_s * np.clip(lum / 0.25, 0.0, 1.0)                    # desaturate darks
+
+    # ── Vectorised HSV → RGB (h is scalar → i, f are scalars) ────
+    h6 = t_h / 60.0
+    i  = int(h6) % 6
+    f  = h6 - int(h6)
+
+    p  = out_v * (1.0 - out_s)
+    q  = out_v * (1.0 - out_s * f)
+    tc = out_v * (1.0 - out_s * (1.0 - f))
+
+    # sector table: [R, G, B] per sector index
+    sectors = [
+        (out_v, tc,    p    ),   # 0
+        (q,     out_v, p    ),   # 1
+        (p,     out_v, tc   ),   # 2
+        (p,     q,     out_v),   # 3
+        (tc,    p,     out_v),   # 4
+        (out_v, p,     q    ),   # 5
     ]
+    r_ch, g_ch, b_ch = sectors[i]
+    colored = np.stack([r_ch, g_ch, b_ch], axis=-1) * 255.0         # (H, W, 3)
 
-    out = np.zeros_like(rgb)
-    n   = len(shades)
-    for i, (sr, sg, sb) in enumerate(shades):
-        mask = (lum >= i/n) & (lum < (i+1)/n)
-        out[mask] = [sr, sg, sb]
-
+    # ── Alpha composite over background ──────
+    a3  = alpha[:, :, np.newaxis]                                    # (H, W, 1)
     bg  = np.array([br, bg_r, bb], dtype=np.float32)
-    res = out * alpha + bg * (1.0 - alpha)
+    res = colored * a3 + bg * (1.0 - a3)
+
     return np.clip(res, 0, 255).astype(np.uint8)
 
 
@@ -916,9 +946,12 @@ async def queue_worker(worker_id: int) -> None:
         try:
             await _run_conversion(task)
         except Exception as exc:
-            logger.exception("Worker #%d: %s", worker_id, exc)
+            logger.exception("Worker #%d task error: %s", worker_id, exc)
             try:
-                await task["bot"].send_message(task["user_id"], "❌ Ошибка конвертации.")
+                await task["bot"].send_message(
+                    task["user_id"],
+                    "❌ Ошибка при конвертации. Попробуй другой стикер.",
+                )
             except Exception:
                 pass
         finally:
@@ -1405,20 +1438,49 @@ def _acquire_pid_lock() -> None:
         sys.exit(1)
 
 
+async def _worker_watchdog(workers: int) -> None:
+    """Restart any worker task that dies unexpectedly."""
+    tasks: list[asyncio.Task] = [
+        asyncio.create_task(queue_worker(i + 1), name=f"worker-{i+1}")
+        for i in range(workers)
+    ]
+    while True:
+        await asyncio.sleep(5)
+        for idx, t in enumerate(tasks):
+            if t.done():
+                exc = t.exception() if not t.cancelled() else None
+                logger.error("Worker #%d died (%s) — restarting", idx + 1, exc)
+                tasks[idx] = asyncio.create_task(
+                    queue_worker(idx + 1), name=f"worker-{idx+1}"
+                )
+
+
 async def main() -> None:
     _acquire_pid_lock()
     db_init()
+
+    # Catch unhandled asyncio exceptions (e.g. from rlottie segfault via executor)
+    def _handle_task_exception(loop: asyncio.AbstractEventLoop, ctx: dict) -> None:
+        exc = ctx.get("exception")
+        logger.error("Unhandled asyncio exception: %s | %s", ctx.get("message"), exc)
+
+    loop = asyncio.get_event_loop()
+    loop.set_exception_handler(_handle_task_exception)
 
     bot = Bot(token=BOT_TOKEN)
     dp  = Dispatcher(storage=MemoryStorage())
     dp.include_router(router)
 
-    for i in range(QUEUE_WORKERS):
-        asyncio.create_task(queue_worker(i + 1))
+    # Watchdog starts and manages all workers
+    asyncio.create_task(_worker_watchdog(QUEUE_WORKERS), name="watchdog")
 
     logger.info("Bot started (workers=%d)", QUEUE_WORKERS)
     try:
-        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+        await dp.start_polling(
+            bot,
+            allowed_updates=dp.resolve_used_update_types(),
+            drop_pending_updates=True,   # don't replay old updates after restart
+        )
     finally:
         try:
             PID_FILE.unlink(missing_ok=True)
