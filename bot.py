@@ -15,6 +15,7 @@ import asyncio
 import io
 import json
 import logging
+import multiprocessing
 import os
 import re
 import sqlite3
@@ -648,34 +649,108 @@ def _tgs_to_frames_fallback(data: bytes) -> tuple[list[Image.Image], int]:
     return frames, int(fr)
 
 
-# ── rlottie_python has priority ──────────────
+# ── rlottie isolated in subprocess (segfault-safe) ──────────────────────────
+#
+# rlottie_python is a C++ extension. Malformed TGS files can cause SIGSEGV
+# which kills the entire Python process. Solution: run rlottie in a child
+# process via multiprocessing. If the child crashes, we catch it and fall
+# back to the pure-Python renderer — the main bot process stays alive.
+# ────────────────────────────────────────────────────────────────────────────
+
+def _rlottie_worker(tgs_path: str, result_queue: "multiprocessing.Queue") -> None:  # type: ignore[name-defined]
+    """
+    Runs inside a child process.
+    Renders all frames and puts (frames_as_png_list, fps) into result_queue.
+    If it crashes (segfault), the queue stays empty — parent detects timeout.
+    """
+    try:
+        import rlottie_python as rl  # type: ignore
+        from PIL import Image as _Image
+        import io as _io
+
+        anim      = rl.LottieAnimation.from_tgs(tgs_path)
+        n         = anim.lottie_animation_get_totalframe()
+        fps       = int(anim.lottie_animation_get_framerate())
+        fw, fh    = anim.lottie_animation_get_size()
+        png_frames: list[bytes] = []
+
+        for i in range(n):
+            buf = anim.lottie_animation_render(i, fw, fh)
+            img = _Image.frombuffer("RGBA", (fw, fh), bytes(buf), "raw", "RGBA")
+            b   = _io.BytesIO()
+            img.save(b, format="PNG")
+            png_frames.append(b.getvalue())
+
+        result_queue.put(("ok", png_frames, fps))
+    except Exception as exc:
+        result_queue.put(("err", str(exc)))
+
 
 try:
-    import rlottie_python  # type: ignore
+    import multiprocessing
+    import rlottie_python  # type: ignore  # only to test availability at import time
 
-    def _tgs_to_frames(data: bytes) -> tuple[list[Image.Image], int]:
-        with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as f:
-            f.write(data)
-            tmp = f.name
-        try:
-            anim = rlottie_python.LottieAnimation.from_tgs(tmp)
-            n    = anim.lottie_animation_get_totalframe()
-            fps  = int(anim.lottie_animation_get_framerate())
-            fw, fh = anim.lottie_animation_get_size()
-            frames = []
-            for i in range(n):
-                buf = anim.lottie_animation_render(i, fw, fh)
-                img = Image.frombuffer("RGBA", (fw, fh), bytes(buf), "raw", "RGBA")
-                frames.append(img)
-            return frames, fps
-        finally:
-            os.unlink(tmp)
-
-    logger.info("rlottie_python: native TGS renderer active")
+    _RLOTTIE_AVAILABLE = True
+    logger.info("rlottie_python available — subprocess-isolated renderer active")
 
 except ImportError:
-    logger.warning("rlottie_python not found — using color-aware fallback")
-    _tgs_to_frames = _tgs_to_frames_fallback  # type: ignore[assignment]
+    _RLOTTIE_AVAILABLE = False
+    logger.warning("rlottie_python not found — using pure-Python fallback renderer")
+
+
+async def _tgs_to_frames(data: bytes) -> tuple[list[Image.Image], int]:  # type: ignore[misc]
+    """
+    Async entry point for TGS decoding.
+    Uses rlottie in an isolated subprocess when available.
+    Falls back to pure-Python renderer on any failure (including segfault).
+    """
+    if not _RLOTTIE_AVAILABLE:
+        return _tgs_to_frames_fallback(data)
+
+    # Write TGS to a temp file (rlottie needs a file path)
+    tmp_path: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as f:
+            f.write(data)
+            tmp_path = f.name
+
+        loop = asyncio.get_event_loop()
+
+        def _run_in_process() -> tuple[list[Image.Image], int]:
+            ctx   = multiprocessing.get_context("spawn")   # safest: fresh interpreter
+            q     = ctx.Queue()
+            proc  = ctx.Process(target=_rlottie_worker, args=(tmp_path, q), daemon=True)
+            proc.start()
+            proc.join(timeout=30)   # max 30 s per animation
+
+            if proc.exitcode != 0 or q.empty():
+                logger.warning(
+                    "rlottie subprocess exited with code %s (segfault?) — using fallback",
+                    proc.exitcode,
+                )
+                return _tgs_to_frames_fallback(data)
+
+            result = q.get_nowait()
+            if result[0] != "ok":
+                logger.warning("rlottie subprocess error: %s — using fallback", result[1])
+                return _tgs_to_frames_fallback(data)
+
+            _, png_list, fps = result
+            frames = [Image.open(io.BytesIO(p)).convert("RGBA") for p in png_list]
+            return frames, fps
+
+        frames, fps = await loop.run_in_executor(None, _run_in_process)
+        return frames, fps
+
+    except Exception as exc:
+        logger.error("TGS subprocess wrapper error: %s — fallback", exc)
+        return _tgs_to_frames_fallback(data)
+    finally:
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -754,7 +829,7 @@ async def process_file(
     src_fps: int               = fps
 
     if file_type == "tgs":
-        frames, src_fps = _tgs_to_frames(file_data)
+        frames, src_fps = await _tgs_to_frames(file_data)
 
     elif file_type == "gif":
         with Image.open(io.BytesIO(file_data)) as gif:
